@@ -4,17 +4,22 @@ namespace App\Http\Controllers\Admin;
 
 use App\Models\Package;
 use App\Models\TrackingHistory;
+use App\Services\PackageService;
 use Illuminate\Http\Request;
 use App\Http\Controllers\Controller;
-use Endroid\QrCode\QrCode;
-use Endroid\QrCode\Writer\PngWriter;
+use App\Mail\TrackingLinkMail;
+use Illuminate\Support\Facades\Mail;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class PackageController extends Controller
 {
-    public function __construct()
+    protected $packageService;
+
+    public function __construct(PackageService $packageService)
     {
         $this->middleware('auth');
         $this->middleware('admin');
+        $this->packageService = $packageService;
     }
 
     public function index()
@@ -41,23 +46,22 @@ class PackageController extends Controller
             'city' => 'required|string',
             'postal_code' => 'required|string',
             'notes' => 'nullable|string',
+            'send_email' => 'nullable|boolean',
         ]);
 
-        $package = new Package($validated);
-        $package->user_id = auth()->id();
-        $package->tracking_number = $package->generateTrackingNumber();
-        $package->qr_code = $this->generateQRCode($package->tracking_number);
-        $package->save();
+        // Créer le colis avec numéro de suivi et QR Code automatique
+        $package = $this->packageService->createPackageWithTracking($validated);
 
-        TrackingHistory::create([
-            'package_id' => $package->id,
-            'status' => 'pending',
-            'description' => 'Colis créé et en attente d\'expédition',
-            'location' => null,
-        ]);
+        // Envoyer l'email au client si demandé
+        if ($request->boolean('send_email')) {
+            $this->sendTrackingEmail($package);
+            $message = 'Colis créé et email de suivi envoyé avec succès';
+        } else {
+            $message = 'Colis créé avec succès';
+        }
 
         return redirect()->route('admin.packages.show', $package)
-            ->with('success', 'Colis créé avec succès');
+            ->with('success', $message);
     }
 
     public function show(Package $package)
@@ -75,14 +79,16 @@ class PackageController extends Controller
     {
         $validated = $request->validate([
             'status' => 'required|in:pending,in_transit,delivered,cancelled',
-            'notes' => 'nullable|string',
+            'location' => 'nullable|string',
+            'description' => 'nullable|string',
         ]);
 
-        $package->update($validated);
-
-        if ($request->has('status') && $request->status !== $package->getOriginal('status')) {
-            $this->createTrackingHistory($package, $request);
-        }
+        $this->packageService->updatePackageStatus(
+            $package,
+            $validated['status'],
+            $validated['location'] ?? null,
+            $validated['description'] ?? null
+        );
 
         return redirect()->route('admin.packages.show', $package)
             ->with('success', 'Colis mis à jour avec succès');
@@ -95,30 +101,56 @@ class PackageController extends Controller
             ->with('success', 'Colis supprimé avec succès');
     }
 
-    protected function generateQRCode($trackingNumber)
+    /**
+     * Envoie le lien de suivi au client par email
+     */
+    public function sendTrackingEmail(Package $package)
     {
-        $qrCode = QrCode::create($trackingNumber);
-        $writer = new PngWriter();
-        $result = $writer->write($qrCode);
-        $dataUri = $result->getDataUri();
-        
-        return $dataUri;
+        Mail::to($package->recipient_email)->send(new TrackingLinkMail($package));
     }
 
-    protected function createTrackingHistory(Package $package, Request $request)
+    /**
+     * Envoie un email de suivi à partir du dashboard
+     */
+    public function resendTrackingEmail(Request $request, Package $package)
     {
-        $statusMessages = [
-            'pending' => 'Colis en attente d\'expédition',
-            'in_transit' => 'Colis en transit',
-            'delivered' => 'Colis livré',
-            'cancelled' => 'Colis annulé',
-        ];
+        $this->sendTrackingEmail($package);
+        return back()->with('success', 'Email de suivi renvoyé avec succès');
+    }
 
-        TrackingHistory::create([
-            'package_id' => $package->id,
-            'status' => $request->status,
-            'description' => $statusMessages[$request->status],
-            'location' => $request->input('location'),
+    /**
+     * Exporte les numéros de suivi en CSV
+     */
+    public function exportCSV()
+    {
+        $csv = $this->packageService->exportTrackingNumbersCSV();
+
+        $response = new StreamedResponse(function () use ($csv) {
+            echo $csv;
+        });
+
+        $response->headers->set('Content-Type', 'text/csv; charset=utf-8');
+        $response->headers->set('Content-Disposition', 'attachment; filename="tracking-numbers-' . now()->format('Y-m-d-His') . '.csv"');
+
+        return $response;
+    }
+
+    /**
+     * Envoie les emails de suivi en masse à plusieurs colis
+     */
+    public function bulkSendEmails(Request $request)
+    {
+        $validated = $request->validate([
+            'package_ids' => 'required|array',
+            'package_ids.*' => 'exists:packages,id',
         ]);
+
+        $packages = Package::whereIn('id', $validated['package_ids'])->get();
+
+        foreach ($packages as $package) {
+            $this->sendTrackingEmail($package);
+        }
+
+        return back()->with('success', 'Emails de suivi envoyés à ' . count($packages) . ' client(s)');
     }
 }
